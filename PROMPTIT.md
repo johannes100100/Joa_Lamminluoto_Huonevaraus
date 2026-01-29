@@ -2118,3 +2118,352 @@ Saat vastauksen (400):
 Jos haluat, voin antaa sulle koko `Program.cs`:n kokonaan päivitettynä niin ettei tarvitse etsiä kohtia.
 
 
+Minä:
+seuraavaksi haluan toiminnon jolla annan huoneen, aikavälin ja tuntimäärän ja api kertoo minulla siltä väliltä kaikki vapaat ajat jotka ovat vähintään niin pitkiä kuin antamani tuntimäärä. Eli seimekiski jos annant välin 2027-05-06 2027-05-08 ja ajan 2h niin jos siellä on aikoja jotka sopivat api kertoo kaikki
+
+
+ChatGPT:
+Onnistuu. Lisätään API:iin uusi endpoint, joka palauttaa **vapaat aikavälit** annetun hakuvälin sisältä, jotka ovat **vähintään** pyydetyn pituisia (esim. 2h).
+
+Idea:
+
+1. haetaan huoneen varaukset, jotka osuvat hakuväliin
+2. järjestetään ja “yhdistetään” päällekkäiset/kiinni olevat varaukset
+3. lasketaan hakuvälin ja varausten väliin jäävät **aukot** (= vapaat slotit)
+4. palautetaan vain ne aukot, joiden kesto ≥ minimi
+
+Alla on tarkat lisäykset sun nykyiseen yhteen `Program.cs` -tiedostoon.
+
+---
+
+## 1) Lisää uusi endpoint top-leveliin
+
+Lisää tämä sun muiden `Map...`-endpointtien joukkoon (esim. GET bookings -endpointin alle):
+
+```csharp
+// Vapaat ajat: antaa hakuvälin ja minimikeston, palauttaa vapaat slotit
+app.MapGet("/rooms/{roomId}/free-slots", (
+    string roomId,
+    DateTimeOffset start,
+    DateTimeOffset end,
+    double minHours,
+    BookingService service) =>
+{
+    try
+    {
+        var minDuration = TimeSpan.FromHours(minHours);
+        var slots = service.GetFreeSlots(roomId, start, end, minDuration);
+        return Results.Ok(slots);
+    }
+    catch (RoomBookingApi.BookingValidationException ex)
+    {
+        return Results.BadRequest(new { errors = ex.Errors }); // jos teit “kaikki virheet” -version
+        // jos et tehnyt, käytä: return Results.BadRequest(new { error = ex.Message });
+    }
+    catch (ArgumentException ex)
+    {
+        return Results.BadRequest(new { error = ex.Message });
+    }
+});
+```
+
+Käyttöesimerkki:
+
+```
+GET http://localhost:5012/rooms/A101/free-slots?start=2027-05-06T00:00:00%2B02:00&end=2027-05-08T00:00:00%2B02:00&minHours=2
+```
+
+---
+
+## 2) Lisää DTO vapaille sloteille namespaceen
+
+Lisää `namespace RoomBookingApi { ... }` sisään (DTO-osioon):
+
+```csharp
+public record FreeSlotDto(DateTimeOffset Start, DateTimeOffset End, double DurationHours);
+```
+
+---
+
+## 3) Lisää `BookingService`-luokkaan metodi `GetFreeSlots`
+
+Lisää `BookingService`-luokan sisään tämä metodi:
+
+```csharp
+public IReadOnlyList<FreeSlotDto> GetFreeSlots(string roomId, DateTimeOffset rangeStart, DateTimeOffset rangeEnd, TimeSpan minDuration)
+{
+    var errors = new List<string>();
+
+    if (string.IsNullOrWhiteSpace(roomId))
+        errors.Add("RoomId puuttuu.");
+
+    if (rangeStart >= rangeEnd)
+        errors.Add("Hakuvälin alun täytyy olla ennen loppua.");
+
+    if (minDuration <= TimeSpan.Zero)
+        errors.Add("Minimikeston täytyy olla > 0.");
+
+    if (errors.Count > 0)
+        throw new BookingValidationException(errors);
+
+    // Otetaan vain varaukset, jotka osuvat hakuväliin millään tavalla
+    var bookings = _repo.GetByRoom(roomId)
+        .Where(b => b.Start < rangeEnd && b.End > rangeStart)
+        .OrderBy(b => b.Start)
+        .ToList();
+
+    // Leikataan varaukset hakuvälin sisään (clamp)
+    var clipped = bookings
+        .Select(b => (Start: Max(b.Start, rangeStart), End: Min(b.End, rangeEnd)))
+        .Where(x => x.Start < x.End)
+        .ToList();
+
+    // Yhdistetään päällekkäiset / kiinni olevat varausjaksot
+    var merged = new List<(DateTimeOffset Start, DateTimeOffset End)>();
+    foreach (var seg in clipped.OrderBy(x => x.Start))
+    {
+        if (merged.Count == 0)
+        {
+            merged.Add(seg);
+            continue;
+        }
+
+        var last = merged[^1];
+
+        // Jos segmentit menee päällekkäin TAI ovat kiinni (last.End == seg.Start), yhdistä
+        if (seg.Start <= last.End)
+        {
+            merged[^1] = (last.Start, Max(last.End, seg.End));
+        }
+        else
+        {
+            merged.Add(seg);
+        }
+    }
+
+    // Nyt lasketaan vapaat slotit hakuväliltä
+    var free = new List<FreeSlotDto>();
+    var cursor = rangeStart;
+
+    foreach (var busy in merged)
+    {
+        if (cursor < busy.Start)
+        {
+            var slotStart = cursor;
+            var slotEnd = busy.Start;
+            var dur = slotEnd - slotStart;
+
+            if (dur >= minDuration)
+                free.Add(new FreeSlotDto(slotStart, slotEnd, dur.TotalHours));
+        }
+
+        cursor = Max(cursor, busy.End);
+    }
+
+    // Hakuvälin loppu
+    if (cursor < rangeEnd)
+    {
+        var dur = rangeEnd - cursor;
+        if (dur >= minDuration)
+            free.Add(new FreeSlotDto(cursor, rangeEnd, dur.TotalHours));
+    }
+
+    return free;
+
+    static DateTimeOffset Max(DateTimeOffset a, DateTimeOffset b) => a > b ? a : b;
+    static DateTimeOffset Min(DateTimeOffset a, DateTimeOffset b) => a < b ? a : b;
+}
+```
+
+> Huom: Tämä palauttaa “vapaat jaksot” sellaisenaan (esim. 6h vapaa jakso näkyy yhtenä slotina).
+> Jos haluat, että API pilkkoo ne esim. “tasatunteihin” tai “2h palasiin”, se on eri sääntö ja voin lisätä sen.
+
+---
+
+## 4) Testaus PowerShellilla
+
+```powershell
+Invoke-RestMethod "http://localhost:5012/rooms/A101/free-slots?start=2027-05-06T00:00:00%2B02:00&end=2027-05-08T00:00:00%2B02:00&minHours=2"
+```
+
+Saat esim.:
+
+```json
+[
+  { "start":"2027-05-06T00:00:00+02:00", "end":"2027-05-06T09:00:00+02:00", "durationHours":9.0 },
+  { "start":"2027-05-06T11:00:00+02:00", "end":"2027-05-08T00:00:00+02:00", "durationHours":37.0 }
+]
+```
+
+
+Minä:
+voitko antaa listan kaikista komennoista niin voin laittaa ne erilliseen tiedostoon
+
+
+ChatGPT:
+Tottakai 👍
+Tässä on **yksi selkeä lista KAIKISTA komennoista / endpointeista**, sellaisena että voit **kopioida tämän sellaisenaan erilliseen tiedostoon** (esim. `commands.ps1`, `README.md` tai palautusdokumenttiin).
+
+Oletan, että API pyörii osoitteessa:
+
+```
+http://localhost:5012
+```
+
+---
+
+# 📌 ROOM BOOKING API – KOMENNOT
+
+## 0️⃣ Käynnistä API
+
+```powershell
+dotnet run --urls http://localhost:5012
+```
+
+---
+
+## 1️⃣ Luo varaus (POST /bookings)
+
+```powershell
+Invoke-RestMethod `
+  -Method POST `
+  -Uri http://localhost:5012/bookings `
+  -ContentType "application/json" `
+  -Body '{
+    "roomId": "A101",
+    "reservedBy": "Matti",
+    "start": "2026-06-01T10:00:00+02:00",
+    "end": "2026-06-01T12:00:00+02:00"
+  }'
+```
+
+### Onnistuu → `201 Created`
+
+Palauttaa varauksen JSON-muodossa (sisältää `id`).
+
+---
+
+## 2️⃣ Listaa huoneen varaukset (GET /rooms/{roomId}/bookings)
+
+```powershell
+Invoke-RestMethod http://localhost:5012/rooms/A101/bookings
+```
+
+Palauttaa:
+
+```json
+[
+  {
+    "id": "...",
+    "roomId": "A101",
+    "reservedBy": "Matti",
+    "start": "...",
+    "end": "..."
+  }
+]
+```
+
+---
+
+## 3️⃣ Peruuta varaus (DELETE /bookings/{id})
+
+Korvaa `<ID>` varauksen GUIDilla.
+
+```powershell
+Invoke-RestMethod `
+  -Method DELETE `
+  -Uri http://localhost:5012/bookings/<ID>
+```
+
+Onnistuu → `204 No Content`
+
+---
+
+## 4️⃣ Hae vapaat ajat (24/7) (GET /rooms/{roomId}/free-slots)
+
+Parametrit:
+
+* `start` = hakuvälin alku
+* `end` = hakuvälin loppu
+* `minHours` = minimikesto tunneissa
+
+```powershell
+Invoke-RestMethod `
+  "http://localhost:5012/rooms/A101/free-slots?start=2027-05-06T00:00:00%2B02:00&end=2027-05-08T00:00:00%2B02:00&minHours=2"
+```
+
+Palauttaa:
+
+```json
+[
+  {
+    "start": "2027-05-06T00:00:00+02:00",
+    "end": "2027-05-06T09:00:00+02:00",
+    "durationHours": 9.0
+  }
+]
+```
+
+---
+
+## 5️⃣ Näytä virheviestit PowerShellissa (helper)
+
+### Lisää tämä PowerShelliin (EI C#-koodiin):
+
+```powershell
+function Post-Booking($url, $json) {
+  try {
+    Invoke-RestMethod -Method POST -Uri $url -ContentType "application/json" -Body $json
+  } catch {
+    "Status: $($_.Exception.Response.StatusCode.value__)"
+    $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+    $reader.ReadToEnd()
+  }
+}
+```
+
+### Käyttö:
+
+```powershell
+Post-Booking "http://localhost:5012/bookings" '{
+  "roomId": "",
+  "reservedBy": "",
+  "start": "2020-01-01T10:00:00+02:00",
+  "end": "2020-01-01T09:00:00+02:00"
+}'
+```
+
+Palauttaa esim:
+
+```text
+Status: 400
+{"errors":["RoomId puuttuu.","ReservedBy puuttuu.","Aloitusajan täytyy olla ennen lopetusaikaa.","Varaus ei voi alkaa menneisyydessä."]}
+```
+
+---
+
+## 6️⃣ Testaa onko API käynnissä
+
+```powershell
+Test-NetConnection localhost -Port 5012
+```
+
+---
+
+# ✅ YHTEENVETO (palautustekstiin sopiva)
+
+* **POST /bookings** – luo varaus
+* **DELETE /bookings/{id}** – peruuta varaus
+* **GET /rooms/{roomId}/bookings** – listaa varaukset
+* **GET /rooms/{roomId}/free-slots** – hakee vapaat ajat 24/7 annetulla aikavälillä ja minimikestolla
+* **Virheet** palautetaan selkeinä viesteinä (`errors[]`)
+
+---
+
+Jos haluat, voin vielä:
+
+* tehdä tästä **valmiin `commands.ps1` -tiedoston**
+* kirjoittaa **README.md** suoraan palautukseen
+* tai tehdä **Swagger-kuvauksen tekstimuodossa**
+
+Sano vaan 👌
