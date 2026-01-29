@@ -1773,3 +1773,348 @@ Missä ollaan nyt
 
 
 Minä:
+jos jokin varauksessa ei täsmää virhe viesti sanoo vain ristiriita haluaisin sen kertovan mikä on väärin
+
+
+CHatGPT:
+Onneksi tämä on jo melkein kunnossa — sun API **lähettää kyllä tarkemman virheilmoituksen bodyn mukana**, mutta PowerShell näyttää oletuksena vain sen HTTP-statuksen (“409 Ristiriita”) ja heittää poikkeuksen.
+
+Tässä kaksi parannusta:
+
+## 1) Näytä PowerShellissa API:n palauttama virheteksti
+
+Kokeile tätä (tulostaa sekä statuskoodin että bodyn):
+
+```powershell
+try {
+  Invoke-RestMethod `
+    -Method POST `
+    -Uri http://localhost:5012/bookings `
+    -ContentType "application/json" `
+    -Body '{
+      "roomId": "A101",
+      "reservedBy": "Matti",
+      "start": "2026-01-28T10:00:00+02:00",
+      "end": "2026-01-28T11:00:00+02:00"
+    }'
+} catch {
+  "Status: $($_.Exception.Response.StatusCode.value__)"
+  $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+  $reader.ReadToEnd()
+}
+```
+
+Saat ulos esim:
+
+```json
+{"error":"Varaus ei voi alkaa menneisyydessä."}
+```
+
+Tämä toimii heti ilman API-muutoksia.
+
+---
+
+## 2) Tee API:sta “oikeaoppisempi”: 400 validaatiolle, 409 vain päällekkäisyydelle
+
+Nyt kaikki `InvalidOperationException` menee 409:ään. Parempi olisi:
+
+* **400 BadRequest**: menneisyys / start>=end / puuttuvat kentät
+* **409 Conflict**: päällekkäinen varaus
+
+### A) Lisää kaksi omaa poikkeusta (namespaceen)
+
+Lisää `namespace RoomBookingApi` -lohkoon:
+
+```csharp
+public class BookingValidationException : Exception
+{
+    public BookingValidationException(string message) : base(message) { }
+}
+
+public class BookingConflictException : Exception
+{
+    public BookingConflictException(string message) : base(message) { }
+}
+```
+
+### B) Muuta `BookingService` heittämään oikeat poikkeukset
+
+Vaihda `ValidateRequest`-kohdassa:
+
+```csharp
+if (request.Start >= request.End)
+    throw new BookingValidationException("Aloitusajan täytyy olla ennen lopetusaikaa.");
+
+if (request.Start < now)
+    throw new BookingValidationException("Varaus ei voi alkaa menneisyydessä.");
+```
+
+Ja päällekkäisyyskohtaan:
+
+```csharp
+if (overlaps)
+    throw new BookingConflictException("Huone on jo varattu kyseiselle aikavälille.");
+```
+
+### C) Päivitä MapPost catchit
+
+`app.MapPost("/bookings"...` sisällä:
+
+```csharp
+catch (RoomBookingApi.BookingValidationException ex)
+{
+    return Results.BadRequest(new { error = ex.Message });
+}
+catch (RoomBookingApi.BookingConflictException ex)
+{
+    return Results.Conflict(new { error = ex.Message });
+}
+catch (ArgumentException ex)
+{
+    return Results.BadRequest(new { error = ex.Message });
+}
+```
+
+Nyt saat:
+
+* 400 + “Varaus ei voi alkaa menneisyydessä.”
+* 409 + “Huone on jo varattu kyseiselle aikavälille.”
+
+---
+
+### Suosittelen tekemään molemmat
+
+* **PowerShell catch** → näet virheen heti testatessa
+* **400 vs 409 erottelu** → API:n käytös on selkeä ja “REST-henkinen”
+
+Jos haluat, liitä sun nykyinen `MapPost`-endpointti ja `ValidateRequest`-metodi, niin kirjoitan sulle täsmälleen oikeat rivinvaihdot suoraan sun koodiin (ettei mene kopioinnissa pieleen).
+
+
+Minä:
+ei antanut muuta kuin tämän taas
+
+Invoke-RestMethod : Etäpalvelin palautti virheen: (400)
+ Virheellinen pyyntö.
+At line:1 char:1
++ Invoke-RestMethod `
++ ~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : InvalidOperation: (Syste  
+   m.Net.HttpWebRequest:HttpWebRequest) [Invoke-RestM   
+  ethod], WebException
+    + FullyQualifiedErrorId : WebCmdletWebResponseExce  
+   ption,Microsoft.PowerShell.Commands.InvokeRestMeth   
+  odCommand
+
+voiko johtua siitä että on enemmän kuin yksi virhe pyynnössä esim tuossa että molemmat alku ja loppu ovat menneisyydessä
+
+
+ChatGPT:
+Ei johdu siitä, että pyynnössä olisi “useampi virhe”. Sun API palauttaa edelleen **JSON bodyn** (esim. `{ "error": "..." }`), mutta **PowerShell heittää virheen ja ei tulosta bodyn sisältöä automaattisesti**, kun statuskoodi on 400/409.
+
+Eli: **API kyllä kertoo mikä on väärin**, mutta sun terminaali ei näytä sitä.
+
+### Näytä bodyn virheviesti PowerShellissa (toimiva tapa)
+
+Käytä tätä “catch-lukijaa”:
+
+```powershell
+try {
+  Invoke-RestMethod `
+    -Method POST `
+    -Uri http://localhost:5012/bookings `
+    -ContentType "application/json" `
+    -Body '{
+      "roomId": "A101",
+      "reservedBy": "Matti",
+      "start": "2020-01-01T10:00:00+02:00",
+      "end": "2020-01-01T11:00:00+02:00"
+    }'
+} catch {
+  "Status: $($_.Exception.Response.StatusCode.value__)"
+  $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+  $reader.ReadToEnd()
+}
+```
+
+Saat näkyviin esim:
+
+```json
+{"error":"Varaus ei voi alkaa menneisyydessä."}
+```
+
+---
+
+## Tee tästä helppo: tee oma funktio `Post-Booking`
+
+Liitä tämä PowerShelliin kerran:
+
+```powershell
+function Post-Booking($url, $json) {
+  try {
+    Invoke-RestMethod -Method POST -Uri $url -ContentType "application/json" -Body $json
+  } catch {
+    "Status: $($_.Exception.Response.StatusCode.value__)"
+    $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+    $reader.ReadToEnd()
+  }
+}
+```
+
+Ja käytä:
+
+```powershell
+Post-Booking "http://localhost:5012/bookings" '{
+  "roomId":"A101",
+  "reservedBy":"Matti",
+  "start":"2020-01-01T10:00:00+02:00",
+  "end":"2020-01-01T11:00:00+02:00"
+}'
+```
+
+---
+
+## “Useampi virhe” -tilanne
+
+Tällä hetkellä sun `ValidateRequest` heittää **ensimmäisestä** virheestä ja lopettaa (se on normaalia).
+Jos haluat että API palauttaa **kaikki virheet kerralla** (lista), sekin onnistuu helposti:
+
+Esim. vastaus olisi:
+
+```json
+{ "errors": ["RoomId puuttuu.", "Varaus ei voi alkaa menneisyydessä."] }
+```
+
+Jos haluat tämän, sanon sulle tarkat muutokset `ValidateRequest`iin ja `MapPost`iin.
+
+---
+
+### Yhteenveto
+
+* Ei, ei johdu “kahdesta virheestä”.
+* Ongelma on se, että PowerShell **ei tulosta error-bodyä** oletuksena.
+* Käytä yllä olevaa `try/catch`-lukijaa niin näet aina tarkan viestin.
+
+Haluatko että muutetaan API palauttamaan **kaikki validaatiovirheet listana** (yhdellä vastauksella), vai riittääkö että PowerShell näyttää nykyisen `{ error: ... }` oikein?
+
+
+Minä:
+Okei nyt haluan koodiin funktion että se kertoo kaikki virheet jotka ovat samaan aikaan ei vain yhtä
+
+
+ChatGPT:
+Onnistuu. Tehdään niin, että `ValidateRequest` **kerää kaikki virheet listaan** ja heittää lopuksi yhden `BookingValidationException`:in, joka sisältää ne. Lisäksi muutetaan API:n vastaus muotoon:
+
+```json
+{ "errors": ["...", "..."] }
+```
+
+Alla on suorat muutokset sun koodiin (helppo kopioida).
+
+---
+
+## 1) Muuta `BookingValidationException` tukemaan listaa
+
+Korvaa nykyinen `BookingValidationException` tällä:
+
+```csharp
+public class BookingValidationException : Exception
+{
+    public IReadOnlyList<string> Errors { get; }
+
+    public BookingValidationException(IEnumerable<string> errors)
+        : base("Validation failed.")
+    {
+        Errors = errors.ToList();
+    }
+}
+```
+
+---
+
+## 2) Muuta `ValidateRequest` keräämään kaikki virheet
+
+Korvaa sun `ValidateRequest`-metodi tällä:
+
+```csharp
+private static void ValidateRequest(BookingRequest request, DateTimeOffset now)
+{
+    var errors = new List<string>();
+
+    if (string.IsNullOrWhiteSpace(request.RoomId))
+        errors.Add("RoomId puuttuu.");
+
+    if (string.IsNullOrWhiteSpace(request.ReservedBy))
+        errors.Add("ReservedBy puuttuu.");
+
+    // Tarkista ajat vain jos ne ovat järkevästi annettuja
+    if (request.Start >= request.End)
+        errors.Add("Aloitusajan täytyy olla ennen lopetusaikaa.");
+
+    if (request.Start < now)
+        errors.Add("Varaus ei voi alkaa menneisyydessä.");
+
+    if (errors.Count > 0)
+        throw new BookingValidationException(errors);
+}
+```
+
+> Huom: Tässä tulee samaan aikaan esim. sekä “menneisyydessä” että “start ennen end” jos molemmat pätee.
+
+---
+
+## 3) Muuta MapPost palauttamaan errors-lista (400)
+
+Vaihda `MapPost`-catch tästä:
+
+```csharp
+catch (RoomBookingApi.BookingValidationException ex)
+{
+    return Results.BadRequest(new { error = ex.Message });
+}
+```
+
+tähän:
+
+```csharp
+catch (RoomBookingApi.BookingValidationException ex)
+{
+    return Results.BadRequest(new { errors = ex.Errors });
+}
+```
+
+Pidä `BookingConflictException` ennallaan:
+
+```csharp
+catch (RoomBookingApi.BookingConflictException ex)
+{
+    return Results.Conflict(new { error = ex.Message });
+}
+```
+
+---
+
+## Lopputulos
+
+Jos lähetät pyynnön, jossa:
+
+* `start >= end`
+* ja `start` on menneisyydessä
+* ja vaikka `reservedBy` puuttuu
+
+Saat vastauksen (400):
+
+```json
+{
+  "errors": [
+    "ReservedBy puuttuu.",
+    "Aloitusajan täytyy olla ennen lopetusaikaa.",
+    "Varaus ei voi alkaa menneisyydessä."
+  ]
+}
+```
+
+---
+
+Jos haluat, voin antaa sulle koko `Program.cs`:n kokonaan päivitettynä niin ettei tarvitse etsiä kohtia.
+
+

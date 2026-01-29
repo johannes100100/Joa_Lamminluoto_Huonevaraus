@@ -1,3 +1,16 @@
+/* Laittakaa tämä PowerShelliin niin saatte kaikki errorit näkyviin oikein
+
+function Post-Booking($url, $json) {
+  try {
+    Invoke-RestMethod -Method POST -Uri $url -ContentType "application/json" -Body $json
+  } catch {
+    "Status: $($_.Exception.Response.StatusCode.value__)"
+    $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+    $reader.ReadToEnd()
+  }
+} */
+
+
 using Microsoft.OpenApi;
 using RoomBookingApi;
 
@@ -32,13 +45,17 @@ app.MapPost("/bookings", (RoomBookingApi.CreateBookingDto dto, BookingService se
 
         return Results.Created($"/bookings/{booking.Id}", Mapper.ToDto(booking));
     }
+    catch (RoomBookingApi.BookingValidationException ex)
+    {
+        return Results.BadRequest(new { errors = ex.Errors });
+    }
+    catch (RoomBookingApi.BookingConflictException ex)
+    {
+        return Results.Conflict(new { error = ex.Message });
+    }
     catch (ArgumentException ex)
     {
         return Results.BadRequest(new { error = ex.Message });
-    }
-    catch (InvalidOperationException ex)
-    {
-        return Results.Conflict(new { error = ex.Message });
     }
 });
 
@@ -94,6 +111,23 @@ namespace RoomBookingApi
         public required DateTimeOffset End { get; init; }
     }
 
+   public class BookingValidationException : Exception
+    {
+        public IReadOnlyList<string> Errors { get; }
+
+        public BookingValidationException(IEnumerable<string> errors)
+            : base("Validation failed.")
+        {
+            Errors = errors.ToList();
+        }
+    }
+
+
+    public class BookingConflictException : Exception
+    {
+        public BookingConflictException(string message) : base(message) { }
+    }
+
     public interface IBookingRepository
     {
         Booking Add(Booking booking);
@@ -142,7 +176,7 @@ namespace RoomBookingApi
                 // Päällekkäisyys [Start, End): start < existingEnd && end > existingStart
                 var overlaps = existing.Any(b => request.Start < b.End && request.End > b.Start);
                 if (overlaps)
-                    throw new InvalidOperationException("Huone on jo varattu kyseiselle aikavälille.");
+                    throw new BookingConflictException("Huone on jo varattu kyseiselle aikavälille.");
 
                 var booking = new Booking(Guid.NewGuid(), request.RoomId, request.ReservedBy, request.Start, request.End);
                 return _repo.Add(booking);
@@ -160,18 +194,25 @@ namespace RoomBookingApi
         }
 
         private static void ValidateRequest(BookingRequest request, DateTimeOffset now)
-        {
-            if (string.IsNullOrWhiteSpace(request.RoomId))
-                throw new ArgumentException("RoomId puuttuu.");
+    {
+        var errors = new List<string>();
 
-            if (string.IsNullOrWhiteSpace(request.ReservedBy))
-                throw new ArgumentException("ReservedBy puuttuu.");
+        if (string.IsNullOrWhiteSpace(request.RoomId))
+            errors.Add("RoomId puuttuu.");
 
-            if (request.Start >= request.End)
-                throw new InvalidOperationException("Aloitusajan täytyy olla ennen lopetusaikaa.");
+        if (string.IsNullOrWhiteSpace(request.ReservedBy))
+            errors.Add("ReservedBy puuttuu.");
 
-            if (request.Start < now)
-                throw new InvalidOperationException("Varaus ei voi alkaa menneisyydessä.");
-        }
+        // Tarkista ajat vain jos ne ovat järkevästi annettuja
+        if (request.Start >= request.End)
+            errors.Add("Aloitusajan täytyy olla ennen lopetusaikaa.");
+
+        if (request.Start < now)
+            errors.Add("Varaus ei voi alkaa menneisyydessä.");
+
+        if (errors.Count > 0)
+            throw new BookingValidationException(errors);
+    }
+
     }
 }
